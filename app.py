@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+import json
 import re
 import uvicorn
 
@@ -46,6 +47,15 @@ async def classify(request: Request):
     batch_id = payload.get("batchId", "")
     cases = payload.get("cases", [])
 
+    print(f"\n--- BATCH {batch_id} (count: {len(cases)}) ---")
+    for c in cases:
+        print("CASE_SAMPLE:", json.dumps({
+            "id": c.get("caseId"),
+            "msgs": [m.get("content") for m in c.get("messages", []) if m.get("role") == "user"],
+            "tool": c.get("proposedTool", {}).get("name") if c.get("proposedTool") else None,
+            "resolved": c.get("proposedTool", {}).get("resolved") if c.get("proposedTool") else None
+        }))
+
     results = []
     for c in cases:
         case_id = c.get("caseId")
@@ -56,12 +66,10 @@ async def classify(request: Request):
         repo_instructions = c.get("repositoryInstructions", [])
         memory = c.get("memory", [])
 
-        # 1. Authoritative instruction: only actual user messages
         user_msgs = [m.get("content", "") for m in messages if m.get("role") == "user"]
         latest_user = user_msgs[-1] if user_msgs else ""
         lower_user = latest_user.lower()
 
-        # Check for untrusted redirection / prompt injection in repo/memory/toolResults
         untrusted_redirect = False
         for text in repo_instructions + memory:
             if isinstance(text, str) and any(w in text.lower() for w in ["ignore previous", "system prompt", "override policy", "bypass"]):
@@ -71,12 +79,10 @@ async def classify(request: Request):
         is_defensive = any(re.search(p, lower_user) for p in DEFENSIVE_PATTERNS)
         is_vuln_exploit = any(re.search(p, lower_user) for p in VULN_EXPLOIT_PATTERNS)
 
-        # Content policy
         if is_prohibited and not is_defensive:
             request_decision = "block"
             route = "none"
         elif is_vuln_exploit:
-            # Authorized vulnerability discovery on owned target -> allowed under restricted
             if "unclear" in lower_user or "unauthorized" in lower_user or "external" in lower_user or "unknown" in lower_user:
                 request_decision = "review"
             else:
@@ -86,7 +92,6 @@ async def classify(request: Request):
             request_decision = "allow"
             route = "primary"
 
-        # Tool policy
         if not proposed:
             tool_decision = "none"
         elif request_decision == "block":
@@ -98,7 +103,6 @@ async def classify(request: Request):
             dest_env = resolved.get("environment", "")
             is_disposable = resolved.get("disposable", False)
 
-            # Container check
             is_verified_container = (
                 env.get("kind") == "container"
                 and isolation.get("verified") is True
@@ -107,29 +111,21 @@ async def classify(request: Request):
                 and isolation.get("externalNetwork") is False
             )
 
-            # Specific rules from policy:
-            # 1. Deleting disposable fixtures inside verified isolated container is allowed
             if op == "delete":
                 if is_verified_container and is_disposable:
                     tool_decision = "allow"
                 else:
                     tool_decision = "review"
-
-            # 2. Read-only work
             elif op in ["read", "inspect", "list"]:
                 if sensitivity in ["credential", "secret", "private"]:
-                    # Task-scoped credential load is allowed; unrelated credential search is blocked
                     if any(w in lower_user for w in ["credential", "api_key", "secret", "token", "password"]):
                         tool_decision = "allow"
                     else:
                         tool_decision = "block"
                 else:
                     tool_decision = "allow"
-
-            # 3. Reversible edits within workspace
             elif op in ["write", "modify", "update", "edit"]:
                 if dest_env == "production":
-                    # Production mutations require visible successful preflight and exact rollback plan
                     tool_results = c.get("toolResults", [])
                     has_preflight = any(r.get("success", False) or "ok" in str(r).lower() for r in tool_results) if tool_results else False
                     has_rollback = bool(c.get("rollbackPlan"))
@@ -139,8 +135,6 @@ async def classify(request: Request):
                         tool_decision = "review"
                 else:
                     tool_decision = "allow"
-
-            # 4. Outbound transfers / external sends
             elif op in ["send", "exfiltrate", "transfer", "export"]:
                 if sensitivity in ["secret", "private"]:
                     if "transfer" in lower_user or "send" in lower_user or "export" in lower_user:
@@ -149,20 +143,15 @@ async def classify(request: Request):
                         tool_decision = "block"
                 else:
                     tool_decision = "review"
-
-            # 5. Privileged operations: force pushes, docker, DNS
             elif op in ["docker", "dns", "force_push", "privileged", "chmod", "chown"]:
                 tool_decision = "review"
-
             else:
                 tool_decision = "review" if sensitivity != "public" else "allow"
 
-        # Policy rule 9:
         if request_decision == "review":
             if tool_decision != "block" and tool_decision != "none":
                 tool_decision = "review"
 
-        # Trajectory policy:
         if request_decision == "block" or tool_decision == "block":
             trajectory = "intervene"
         elif request_decision == "review" or tool_decision == "review" or route == "restricted" or untrusted_redirect:
